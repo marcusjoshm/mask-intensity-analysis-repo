@@ -38,6 +38,7 @@ pip install -r requirements.txt
 |--------|--------------|-------------|
 | `per_particle_analysis.py` | Per-particle donut | Measures fluorescence intensity in individual P-bodies and/or Stress Granules using a donut-shaped annulus around each particle for local background estimation. |
 | `whole_field_analysis.py` | Whole-field aggregate | Measures aggregate mNG and Halo channel intensities across all P-body pixels vs. all dilute-mask pixels in each field of view. |
+| `ROI_to_CellposeLabels.ijm` | ImageJ macro | Generates a `cp_mask` cell segmentation label image from ROI Manager selections, used with the `--single-cell` flag. |
 
 ---
 
@@ -213,14 +214,25 @@ my_data/
 ├── WT_Rep1_NaAsO2_SG_mask.tif
 ├── WT_Rep1_NaAsO2_pnorm.tif
 ├── WT_Rep1_NaAsO2_sgnorm.tif
+├── WT_Rep1_NaAsO2_cp_mask.tif      ← optional, for --single-cell mode
 ├── WT_Rep2_NaAsO2_Cap.tif
 ├── WT_Rep2_NaAsO2_P-body_mask.tif
 ├── WT_Rep2_NaAsO2_SG_mask.tif
 ├── WT_Rep2_NaAsO2_pnorm.tif
-└── WT_Rep2_NaAsO2_sgnorm.tif
+├── WT_Rep2_NaAsO2_sgnorm.tif
+└── WT_Rep2_NaAsO2_cp_mask.tif      ← optional, for --single-cell mode
 ```
 
-In this example, the group keys are `WT_Rep1_NaAsO2` and `WT_Rep2_NaAsO2`. Each group has 5 files (Cap + P-body_mask + SG_mask + pnorm + sgnorm), enabling both P-body and SG analysis.
+In this example, the group keys are `WT_Rep1_NaAsO2` and `WT_Rep2_NaAsO2`. Each group has 5 files (Cap + P-body_mask + SG_mask + pnorm + sgnorm), enabling both P-body and SG analysis. The `cp_mask` files are optional and only needed when using `--single-cell`.
+
+### The `cp_mask` File
+
+The `cp_mask` (cellpose mask) file is a 16-bit TIFF label image used for single-cell analysis. Each pixel value represents a unique cell ID (1, 2, 3, ...), and background pixels are 0. When `--single-cell` is passed, the script uses this mask to assign each particle (or each pixel region) to the cell that contains it, then aggregates measurements per cell rather than per particle or per field.
+
+- **Format:** 16-bit TIFF with integer labels (supports up to 65,535 cells)
+- **Naming:** Must follow the standard convention: `{group_key}_cp_mask.tif`
+- **Generation:** Use the included `ROI_to_CellposeLabels.ijm` ImageJ macro (see [Generating cp_mask Files with ImageJ](#generating-cp_mask-files-with-imagej) below), or any cell segmentation tool (e.g., Cellpose) that produces integer-labeled masks
+- **Behavior:** If `--single-cell` is passed but a group is missing its `cp_mask` file, that group is skipped with a warning
 
 ### SiR_mean Mode File Naming
 
@@ -324,6 +336,34 @@ python per_particle_analysis.py \
 | `cap_over_pnorm_dilute` | Cap-to-normalization ratio in donut |
 
 SG output columns follow the same pattern with `sg` replacing `pbody` and `sgnorm` replacing `pnorm`.
+
+---
+
+## Generating cp_mask Files with ImageJ
+
+The included `ROI_to_CellposeLabels.ijm` macro creates a cellpose-style cell segmentation mask from manually drawn ROIs in ImageJ/FIJI. This mask is used with the `--single-cell` flag in either Python script.
+
+### Prerequisites
+
+1. Open a TIFF image of the correct dimensions in ImageJ (e.g., one of the channel images from the image set you want to analyze)
+2. Draw cell boundary ROIs using any selection tool (freehand, polygon, etc.) and add each one to the ROI Manager (`T` to add, or Analyze > Tools > ROI Manager)
+
+### Running the Macro
+
+1. Open the macro: Plugins > Macros > Run... > select `ROI_to_CellposeLabels.ijm`
+2. The macro creates a new 16-bit label image where each ROI is filled with a unique integer (1, 2, 3, ...)
+3. Save the result as TIFF: File > Save As > Tiff...
+4. **Rename the file** to match the naming convention: `{group_key}_cp_mask.tif` (e.g., `WT_Rep1_NaAsO2_cp_mask.tif`)
+5. Place the file in the same data directory as the other channel images for that group
+
+### Single-Cell Output
+
+When `--single-cell` is used, the output changes from one row per particle (or per field) to **one row per cell per image set**:
+
+- **`per_particle_analysis.py`:** Particles are assigned to the cell containing the majority of their pixels. Per-cell means are area-weighted across all particles in that cell, and integrated intensities are summed. Ratios are recomputed from the aggregated means. Additional columns: `cell_id`, `cell_area_px`, `n_pbodys` (or `n_sgs`), `total_pbody_area_px` (or `total_sg_area_px`).
+- **`whole_field_analysis.py`:** The P-body mask and dilute mask are intersected with each cell region. Intensities are measured within each cell's portion of the masks independently. Additional columns: `cell_id`, `cell_area_px`.
+
+Cells that contain no particles (in per-particle mode) or no mask pixels (in whole-field mode) still appear in the output with NaN for all intensity metrics, so every segmented cell is represented.
 
 ---
 
