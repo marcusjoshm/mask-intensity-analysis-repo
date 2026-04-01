@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Data and results
+*.tif
+*.tiff
+*.csv
+*.xlsx
+*.prism
+*_results/
+*_reults/
+*_images/
+*_image/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / tools
+.claude/
+.vscode/
+.idea/
+
+# Archive
+archive/
+
+# PDFs (analysis docs, not code)
+*.pdf
+
+# Misc
+untitled folder/
+untitled folder 2/
