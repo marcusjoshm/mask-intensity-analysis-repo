@@ -13,7 +13,7 @@ Requires **Python 3.9 or higher**.
 ### Mac / Linux
 
 ```bash
-git clone https://github.com/<org>/mask-intensity-analysis-repo.git
+git clone https://github.com/marcusjoshm/mask-intensity-analysis-repo.git
 cd mask-intensity-analysis-repo
 python3 -m venv venv
 source venv/bin/activate
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 ### Windows
 
 ```cmd
-git clone https://github.com/<org>/mask-intensity-analysis-repo.git
+git clone https://github.com/marcusjoshm/mask-intensity-analysis-repo.git
 cd mask-intensity-analysis-repo
 python -m venv venv
 venv\Scripts\activate
