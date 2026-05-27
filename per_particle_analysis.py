@@ -491,7 +491,7 @@ PRESETS = {
         'buffer': 5,
         'donut': 5,
         'bg_mode': 'donut-mean',
-        'min_size': 10,
+        'min_size': 4,
         'bgsub_k': 2.5,
         'no_bgsub': False,
         'bg_value': 1,

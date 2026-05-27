@@ -23,7 +23,8 @@ from scipy import stats
 from skimage import measure
 
 
-CHANNELS = ['P-body_mask', 'dilute_mask', 'interaction_mask', 'Dcp2_mask', 'SiR_mask', 'Halo', 'mNG', 'cp_mask']
+CHANNELS = ['P-body_mask', 'dilute_mask', 'interaction_mask', 'interaction_mask_2',
+            'Dcp2_mask', 'Dcp2_mask_2', 'SiR_mask', 'Halo', 'mNG', 'cp_mask']
 
 
 def parse_bg_mode(value):
@@ -120,8 +121,14 @@ def compute_bg_value(image, dilute_mask, bg_mode, exclude_zeros=False, exclude_o
 
 
 def _measure_region(mng_sub, halo_sub, mng_valid, pbody_mask, dilute_mask,
-                    compute_percent=False, flim_mask_img=None, mng_mask_img=None):
-    """Compute mNG/Halo metrics for given P-body and dilute mask regions."""
+                    compute_percent=False, flim_mask_img=None, mng_mask_img=None,
+                    sir_filter=None):
+    """Compute mNG/Halo metrics for given P-body and dilute mask regions.
+
+    When sir_filter is provided (a boolean mask), Halo measurements are
+    restricted to pixels within it: condensed Halo = P-body & SiR, dilute
+    Halo = dilute & SiR. mNG measurements are unaffected.
+    """
     mng_pbody_pixels = mng_sub[pbody_mask]
     mng_dilute_pixels = mng_sub[dilute_mask]
 
@@ -132,6 +139,10 @@ def _measure_region(mng_sub, halo_sub, mng_valid, pbody_mask, dilute_mask,
 
     halo_pbody_valid = pbody_mask & mng_valid
     halo_dilute_valid = dilute_mask & mng_valid
+
+    if sir_filter is not None:
+        halo_pbody_valid = halo_pbody_valid & sir_filter
+        halo_dilute_valid = halo_dilute_valid & sir_filter
 
     halo_pbody_pixels = halo_sub[halo_pbody_valid]
     halo_dilute_pixels = halo_sub[halo_dilute_valid]
@@ -189,6 +200,169 @@ def _measure_region(mng_sub, halo_sub, mng_valid, pbody_mask, dilute_mask,
     return result
 
 
+def _measure_v4_regions(mng_sub, halo_sub, mng_valid,
+                        pbody_mask, dilute_mask,
+                        dcp2_mask, dcp2_mask_2,
+                        interaction_mask, interaction_mask_2,
+                        compute_percent=False,
+                        cell_region=None,
+                        zero_fill_mode=False):
+    """Three-region measurement: P-body, intermediate, dilute.
+
+    v4 vs v5 differ ONLY in how Halo means are computed; mNG means and
+    the percent columns use the same definitions in both modes.
+
+    Halo-handling modes (selected by zero_fill_mode):
+
+    - v4 (zero_fill_mode=False): Halo means use intersect semantics —
+      pixels outside the inner interaction mask are excluded from the
+      mean entirely.
+
+    - v5 (zero_fill_mode=True): Halo means use v3-style zero-fill —
+      pixels outside the inner interaction mask are zeroed and INCLUDED
+      in the mean, dragging it down. mNG dilute region is also broadened
+      to dilute_mask & ~Dcp2_mask_2 (without the Dcp2_mask intersect;
+      nanmean still effectively restricts contributing pixels to inside
+      Dcp2_mask), matching v3's mNG dilute convention.
+
+    Percent columns (same in both modes): "within each compartment,
+    what fraction of the mNG-mask area also has Halo interaction
+    signal." Each percent has its own per-compartment denominator
+    (the compartment's mNG-mask area) and is in [0, 100%]. The three
+    are independent indicators — their sum is not constrained.
+
+    Regions (mng_region defines the denominator/area_px; halo_region
+    is the denominator for the halo mean):
+
+    - P-body: mNG over P-body_mask; Halo over P-body_mask & mng_valid.
+      Same in both modes.
+    - Intermediate: mNG over Dcp2_mask_2. Same in both modes.
+      Halo (v4) over Dcp2_mask_2 & interaction_mask_2 & mng_valid.
+      Halo (v5) over Dcp2_mask_2 & mng_valid, with halo zeroed
+      outside interaction_mask_2.
+    - Dilute (v4): mNG over dilute_mask & Dcp2_mask & ~Dcp2_mask_2;
+      Halo over dilute_mask & interaction_mask & ~interaction_mask_2
+      & mng_valid.
+    - Dilute (v5): mNG over dilute_mask & ~Dcp2_mask_2;
+      Halo over dilute_mask & ~Dcp2_mask_2 & mng_valid, with halo
+      zeroed outside (interaction_mask & ~interaction_mask_2).
+
+    When cell_region is supplied, every region (including percent denoms
+    and numerators) is intersected with it, so the result describes a
+    single cell.
+    """
+    pbody_mng_region = pbody_mask
+    pbody_halo_region = pbody_mask & mng_valid
+    halo_for_pbody = halo_sub
+
+    interm_mng_region = dcp2_mask_2
+
+    if zero_fill_mode:
+        interm_halo_region = dcp2_mask_2 & mng_valid
+        halo_for_interm = np.where(interaction_mask_2, halo_sub, 0.0)
+
+        dilute_mng_region = dilute_mask & ~dcp2_mask_2
+        dilute_halo_region = dilute_mask & ~dcp2_mask_2 & mng_valid
+        halo_for_dilute = np.where(interaction_mask & ~interaction_mask_2, halo_sub, 0.0)
+    else:
+        interm_halo_region = dcp2_mask_2 & interaction_mask_2 & mng_valid
+        halo_for_interm = halo_sub
+
+        dilute_mng_region = dilute_mask & dcp2_mask & ~dcp2_mask_2
+        dilute_halo_region = dilute_mask & interaction_mask & ~interaction_mask_2 & mng_valid
+        halo_for_dilute = halo_sub
+
+    if cell_region is not None:
+        pbody_mng_region = pbody_mng_region & cell_region
+        pbody_halo_region = pbody_halo_region & cell_region
+        interm_mng_region = interm_mng_region & cell_region
+        interm_halo_region = interm_halo_region & cell_region
+        dilute_mng_region = dilute_mng_region & cell_region
+        dilute_halo_region = dilute_halo_region & cell_region
+
+    def _stats(arr, region):
+        pixels = arr[region]
+        if pixels.size > 0 and np.any(~np.isnan(pixels)):
+            return np.nanmean(pixels), np.nansum(pixels)
+        return np.nan, np.nan
+
+    mng_pbody_mean, mng_pbody_integ = _stats(mng_sub, pbody_mng_region)
+    mng_interm_mean, mng_interm_integ = _stats(mng_sub, interm_mng_region)
+    mng_dilute_mean, mng_dilute_integ = _stats(mng_sub, dilute_mng_region)
+    halo_pbody_mean, halo_pbody_integ = _stats(halo_for_pbody, pbody_halo_region)
+    halo_interm_mean, halo_interm_integ = _stats(halo_for_interm, interm_halo_region)
+    halo_dilute_mean, halo_dilute_integ = _stats(halo_for_dilute, dilute_halo_region)
+
+    def _ratio(a, b):
+        if b and not np.isnan(a) and not np.isnan(b) and b != 0:
+            return a / b
+        return np.nan
+
+    result = {
+        'pbody_area_px': int(pbody_mng_region.sum()),
+        'intermediate_area_px': int(interm_mng_region.sum()),
+        'dilute_area_px': int(dilute_mng_region.sum()),
+        'mNG_pbody_mean': mng_pbody_mean,
+        'mNG_intermediate_mean': mng_interm_mean,
+        'mNG_dilute_mean': mng_dilute_mean,
+        'mNG_pbody_integ': mng_pbody_integ,
+        'mNG_intermediate_integ': mng_interm_integ,
+        'mNG_dilute_integ': mng_dilute_integ,
+        'halo_pbody_mean': halo_pbody_mean,
+        'halo_intermediate_mean': halo_interm_mean,
+        'halo_dilute_mean': halo_dilute_mean,
+        'halo_pbody_integ': halo_pbody_integ,
+        'halo_intermediate_integ': halo_interm_integ,
+        'halo_dilute_integ': halo_dilute_integ,
+        'mNG_pbody_over_dilute': _ratio(mng_pbody_mean, mng_dilute_mean),
+        'mNG_intermediate_over_dilute': _ratio(mng_interm_mean, mng_dilute_mean),
+        'halo_pbody_over_dilute': _ratio(halo_pbody_mean, halo_dilute_mean),
+        'halo_intermediate_over_dilute': _ratio(halo_interm_mean, halo_dilute_mean),
+        'halo_over_mNG_pbody': _ratio(halo_pbody_mean, mng_pbody_mean),
+        'halo_over_mNG_intermediate': _ratio(halo_interm_mean, mng_interm_mean),
+        'halo_over_mNG_dilute': _ratio(halo_dilute_mean, mng_dilute_mean),
+    }
+
+    if compute_percent:
+        # "Within each compartment, what fraction of the mNG-mask area
+        # also has Halo interaction signal." Three independent indicators —
+        # each is in [0, 100%] and the three are NOT a partition of any
+        # shared whole, so their sum is unconstrained.
+        # Same definition in both zero_fill_mode branches; v4 vs v5 differ
+        # only in Halo means.
+        pbody_perc_denom = pbody_mask & dcp2_mask
+        pbody_perc_num = pbody_perc_denom & interaction_mask
+
+        interm_perc_denom = dcp2_mask_2
+        interm_perc_num = interm_perc_denom & interaction_mask_2
+
+        dilute_perc_denom = dilute_mask & dcp2_mask & ~dcp2_mask_2
+        dilute_perc_num = dilute_perc_denom & interaction_mask & ~interaction_mask_2
+
+        if cell_region is not None:
+            pbody_perc_denom = pbody_perc_denom & cell_region
+            pbody_perc_num = pbody_perc_num & cell_region
+            interm_perc_denom = interm_perc_denom & cell_region
+            interm_perc_num = interm_perc_num & cell_region
+            dilute_perc_denom = dilute_perc_denom & cell_region
+            dilute_perc_num = dilute_perc_num & cell_region
+
+        pbody_d = int(pbody_perc_denom.sum())
+        result['pct_halo_in_mNG_pbody'] = (
+            (int(pbody_perc_num.sum()) / pbody_d) * 100 if pbody_d > 0 else np.nan
+        )
+        interm_d = int(interm_perc_denom.sum())
+        result['pct_halo_in_mNG_intermediate'] = (
+            (int(interm_perc_num.sum()) / interm_d) * 100 if interm_d > 0 else np.nan
+        )
+        dilute_d = int(dilute_perc_denom.sum())
+        result['pct_halo_in_mNG_dilute'] = (
+            (int(dilute_perc_num.sum()) / dilute_d) * 100 if dilute_d > 0 else np.nan
+        )
+
+    return result
+
+
 def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
                       mng_bg_mode, halo_bg_mode, min_size, exclude_halo_zero=True,
                       exclude_halo_one=False, sir_mask_path=None,
@@ -198,7 +372,12 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
                       compute_percent=False,
                       save_processed=False, save_dir=None, group_key=None,
                       halo_bg_override=None,
-                      single_cell=False, cp_mask_path=None):
+                      single_cell=False, cp_mask_path=None,
+                      sir_filter=False,
+                      intermediate_assemblies=False,
+                      dcp2_mask_2_path=None,
+                      interaction_mask_2_path=None,
+                      intermediate_zero_fill=False):
     """Analyze one image set and return whole-field measurements."""
     pbody_mask_raw = tifffile.imread(pbody_mask_path)
     dilute_mask_img = tifffile.imread(dilute_mask_path)
@@ -247,6 +426,15 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
     # Filter P-body mask by min size
     pbody_mask = filter_mask_by_size(pbody_mask_raw, min_size)
     dilute_mask = dilute_mask_img > 0
+
+    # --- SiR filter: restrict Halo measurements to within SiR_mask ---
+    sir_filter_region = None
+    if sir_filter and sir_mask_path is not None:
+        sir_filter_img = tifffile.imread(sir_mask_path)
+        sir_filter_region = sir_filter_img > 0
+        print(f"  SiR filter applied: Halo measured only within SiR_mask "
+              f"({int(sir_filter_region.sum())} px); condensed = P-body & SiR, "
+              f"dilute = dilute & SiR")
 
     # --- mNG background subtraction first (Halo 'mng-nan' mode depends on it) ---
     mng_bg = compute_bg_value(mng_img, dilute_mask, mng_bg_mode)
@@ -323,11 +511,87 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
     print(f"  P-body mask area: {pbody_mask.sum()} px | Dilute mask area: {dilute_mask.sum()} px")
     print(f"  mNG bg: {mng_bg_label} | Halo bg: {halo_bg_label}")
 
+    # --- v4: intermediate-assemblies three-region mode ---
+    if intermediate_assemblies:
+        dcp2_full = tifffile.imread(mng_mask_path) > 0
+        interaction_full = tifffile.imread(flim_mask_path) > 0
+        dcp2_inner = tifffile.imread(dcp2_mask_2_path) > 0
+        interaction_inner = tifffile.imread(interaction_mask_2_path) > 0
+
+        if single_cell and cp_mask_path is not None:
+            cp_mask_img = tifffile.imread(cp_mask_path)
+            cell_ids = np.unique(cp_mask_img)
+            cell_ids = cell_ids[cell_ids != 0]
+
+            # Particle counts per cell: same majority-ownership rule as v3 single-cell.
+            pbody_labels = measure.label(pbody_mask)
+            particle_counts_per_cell = defaultdict(int)
+            for prop in measure.regionprops(pbody_labels):
+                ys, xs = prop.coords[:, 0], prop.coords[:, 1]
+                cell_values = cp_mask_img[ys, xs]
+                values, counts = np.unique(cell_values, return_counts=True)
+                majority_cell = int(values[np.argmax(counts)])
+                if majority_cell != 0:
+                    particle_counts_per_cell[majority_cell] += 1
+
+            results = []
+            for cell_id in cell_ids:
+                cell_region = cp_mask_img == cell_id
+
+                metrics = _measure_v4_regions(mng_sub, halo_sub, mng_valid,
+                                              pbody_mask, dilute_mask,
+                                              dcp2_full, dcp2_inner,
+                                              interaction_full, interaction_inner,
+                                              compute_percent=compute_percent,
+                                              cell_region=cell_region,
+                                              zero_fill_mode=intermediate_zero_fill)
+                mng_cell_pixels = mng_sub[cell_region]
+                mng_cell_mean = (np.nanmean(mng_cell_pixels)
+                                 if mng_cell_pixels.size > 0 and np.any(~np.isnan(mng_cell_pixels))
+                                 else np.nan)
+
+                metrics['cell_id'] = int(cell_id)
+                metrics['cell_area_px'] = int(cell_region.sum())
+                metrics['particle_count'] = particle_counts_per_cell.get(int(cell_id), 0)
+                metrics['mNG_cell_mean'] = mng_cell_mean
+                metrics['mng_bg_value'] = mng_bg
+                metrics['halo_bg_value'] = halo_bg
+                results.append(metrics)
+
+            print(f"  Single-cell v4: {len(cell_ids)} cells analyzed")
+            return results
+
+        result = _measure_v4_regions(mng_sub, halo_sub, mng_valid,
+                                     pbody_mask, dilute_mask,
+                                     dcp2_full, dcp2_inner,
+                                     interaction_full, interaction_inner,
+                                     compute_percent=compute_percent,
+                                     zero_fill_mode=intermediate_zero_fill)
+        result['mng_bg_value'] = mng_bg
+        result['halo_bg_value'] = halo_bg
+        print(f"  Intermediate area: {result['intermediate_area_px']} px | "
+              f"Dilute area: {result['dilute_area_px']} px")
+        return [result]
+
     # --- Single-cell mode: compute metrics per cell ---
     if single_cell and cp_mask_path is not None:
         cp_mask_img = tifffile.imread(cp_mask_path)
         cell_ids = np.unique(cp_mask_img)
         cell_ids = cell_ids[cell_ids != 0]
+
+        # Label P-body particles once globally and assign each to its
+        # majority-owning cell (the cell containing the most of its pixels).
+        # Particles whose majority falls in background (cp_mask == 0) are
+        # not attributed to any cell.
+        pbody_labels = measure.label(pbody_mask)
+        particle_counts_per_cell = defaultdict(int)
+        for prop in measure.regionprops(pbody_labels):
+            ys, xs = prop.coords[:, 0], prop.coords[:, 1]
+            cell_values = cp_mask_img[ys, xs]
+            values, counts = np.unique(cell_values, return_counts=True)
+            majority_cell = int(values[np.argmax(counts)])
+            if majority_cell != 0:
+                particle_counts_per_cell[majority_cell] += 1
 
         results = []
         for cell_id in cell_ids:
@@ -337,9 +601,15 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
 
             metrics = _measure_region(mng_sub, halo_sub, mng_valid,
                                       cell_pbody, cell_dilute,
-                                      compute_percent, flim_mask_loaded, mng_mask_loaded)
+                                      compute_percent, flim_mask_loaded, mng_mask_loaded,
+                                      sir_filter=sir_filter_region)
+            mng_cell_pixels = mng_sub[cell_region]
+            mng_cell_mean = np.nanmean(mng_cell_pixels) if mng_cell_pixels.size > 0 and np.any(~np.isnan(mng_cell_pixels)) else np.nan
+
             metrics['cell_id'] = int(cell_id)
             metrics['cell_area_px'] = int(cell_region.sum())
+            metrics['particle_count'] = particle_counts_per_cell.get(int(cell_id), 0)
+            metrics['mNG_cell_mean'] = mng_cell_mean
             metrics['mng_bg_value'] = mng_bg
             metrics['halo_bg_value'] = halo_bg
             results.append(metrics)
@@ -350,7 +620,8 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
     # --- Whole-field measurements ---
     result = _measure_region(mng_sub, halo_sub, mng_valid,
                              pbody_mask, dilute_mask,
-                             compute_percent, flim_mask_loaded, mng_mask_loaded)
+                             compute_percent, flim_mask_loaded, mng_mask_loaded,
+                             sir_filter=sir_filter_region)
     result['mng_bg_value'] = mng_bg
     result['halo_bg_value'] = halo_bg
     return [result]
@@ -360,7 +631,7 @@ def analyze_image_set(pbody_mask_path, dilute_mask_path, halo_path, mng_path,
 # This ensures published results citing a preset version remain reproducible.
 PRESETS = {
     'decapping-sensor-v1': {
-        'min_size': 5,
+        'min_size': 2,
         'mng_bg_mode': 0,
         'halo_bg_mode': 'SiR_mean',
         'mNG_filter': 'NaN',
@@ -368,9 +639,117 @@ PRESETS = {
         'exclude_halo_zero': True,
         'exclude_halo_one': False,
         'SiR_subtract': None,
+        'SiR_filter': False,
         'FLIM_filter': None,
         'mNG_in_FLIM': 'no',
         'save_processed': False,
+        'intermediate_assemblies': False,
+        'intermediate_zero_fill': False,
+    },
+    'decapping-sensor-v2': {
+        # Like v1, but SiR_mask is no longer used for Halo background
+        # subtraction (no SiR_mean). Instead SiR_mask is an intersection
+        # filter on Halo measurements: condensed = P-body & SiR, dilute =
+        # dilute & SiR. Requires a SiR_mask file for every condition/image
+        # set (not just the As condition as in v1's SiR_mean). mNG
+        # measurements are unaffected. Percent columns are dropped.
+        'min_size': 2,
+        'mng_bg_mode': 0,
+        'halo_bg_mode': 0,
+        'mNG_filter': 'NaN',
+        'percent': False,
+        'exclude_halo_zero': True,
+        'exclude_halo_one': False,
+        'SiR_subtract': None,
+        'SiR_filter': True,
+        'FLIM_filter': None,
+        'mNG_in_FLIM': 'no',
+        'save_processed': False,
+        'intermediate_assemblies': False,
+        'intermediate_zero_fill': False,
+    },
+    'decapping-sensor-v3': {
+        # Like v1, but instead of using SiR_mask for Halo background
+        # subtraction (SiR_mean), use interaction_mask via FLIM_filter='zero'
+        # to set Halo pixels outside interaction_mask to 0 before measurement.
+        # Halo background subtraction is disabled (halo_bg_mode=0). Requires
+        # an interaction_mask file in every image set. Percent columns kept.
+        'min_size': 2,
+        'mng_bg_mode': 0,
+        'halo_bg_mode': 0,
+        'mNG_filter': 'NaN',
+        'percent': True,
+        'exclude_halo_zero': True,
+        'exclude_halo_one': False,
+        'SiR_subtract': None,
+        'SiR_filter': False,
+        'FLIM_filter': 'zero',
+        'mNG_in_FLIM': 'no',
+        'save_processed': False,
+        'intermediate_assemblies': False,
+        'intermediate_zero_fill': False,
+    },
+    'decapping-sensor-v4': {
+        # Like v3, but adds an "intermediate assemblies" measurement region
+        # and redefines the dilute region. Three measurement regions per field:
+        #   - P-body: P-body_mask (same as v3).
+        #   - Intermediate: mNG over Dcp2_mask_2;
+        #                   Halo over Dcp2_mask_2 & interaction_mask_2.
+        #   - Dilute: mNG over dilute_mask & Dcp2_mask & ~Dcp2_mask_2;
+        #             Halo over dilute_mask & interaction_mask
+        #             & ~interaction_mask_2.
+        # Requires Dcp2_mask_2 and interaction_mask_2 files in every image
+        # set (in addition to the v3 file requirements). Compatible with
+        # --single-cell (per-cell rows with intermediate columns). Not
+        # compatible with any SiR option.
+        'min_size': 2,
+        'mng_bg_mode': 0,
+        'halo_bg_mode': 0,
+        'mNG_filter': 'NaN',
+        'percent': True,
+        'exclude_halo_zero': True,
+        'exclude_halo_one': False,
+        'SiR_subtract': None,
+        'SiR_filter': False,
+        'FLIM_filter': 'zero',
+        'mNG_in_FLIM': 'no',
+        'save_processed': False,
+        'intermediate_assemblies': True,
+        'intermediate_zero_fill': False,
+    },
+    'decapping-sensor-v5': {
+        # Like v4, but Halo means in the intermediate and dilute regions
+        # use v3-style "zero outside the inner interaction mask" semantics
+        # instead of intersecting it out. The intermediate halo measurement
+        # zeros Halo outside interaction_mask_2; the dilute halo measurement
+        # zeros Halo outside (interaction_mask - interaction_mask_2). These
+        # zeros are INCLUDED in the mean, dragging it down — analogous to
+        # how v3's dilute mean is "diluted" by FLIM-zeroed pixels.
+        #
+        # mNG dilute region is broadened to dilute_mask & ~Dcp2_mask_2
+        # (not intersected with Dcp2_mask) to mirror v3's mNG dilute
+        # convention; NaN handling via nanmean still effectively restricts
+        # the contributing pixels to inside Dcp2_mask.
+        #
+        # Percent columns use the same per-compartment definition as v4
+        # ("within each compartment, what fraction of the mNG-mask area
+        # also has Halo signal"). v5 differs from v4 only in Halo means.
+        #
+        # File requirements and SiR-incompatibility are the same as v4.
+        'min_size': 2,
+        'mng_bg_mode': 0,
+        'halo_bg_mode': 0,
+        'mNG_filter': 'NaN',
+        'percent': True,
+        'exclude_halo_zero': True,
+        'exclude_halo_one': False,
+        'SiR_subtract': None,
+        'SiR_filter': False,
+        'FLIM_filter': 'zero',
+        'mNG_in_FLIM': 'no',
+        'save_processed': False,
+        'intermediate_assemblies': True,
+        'intermediate_zero_fill': True,
     },
 }
 
@@ -383,9 +762,12 @@ ORIGINAL_DEFAULTS = {
     'exclude_halo_zero': True,
     'exclude_halo_one': False,
     'SiR_subtract': None,
+    'SiR_filter': False,
     'FLIM_filter': None,
     'mNG_in_FLIM': 'no',
     'save_processed': False,
+    'intermediate_assemblies': False,
+    'intermediate_zero_fill': False,
 }
 
 PRESET_CONTROLLED_ARGS = set(ORIGINAL_DEFAULTS.keys())
@@ -398,6 +780,14 @@ def validate_presets(presets, parser):
         bad_keys = set(vals.keys()) - valid_dests
         if bad_keys:
             raise ValueError(f"Preset '{name}' references unknown parameters: {bad_keys}")
+        # Presets lock ALL analysis parameters; a missing key would leave that
+        # arg at its argparse default (None) and trip the resolve_args assertion
+        # only when that preset is run. Catch the omission at startup instead.
+        missing_keys = PRESET_CONTROLLED_ARGS - set(vals.keys())
+        if missing_keys:
+            raise ValueError(
+                f"Preset '{name}' is missing required parameters: {sorted(missing_keys)}. "
+                f"Every preset must specify all preset-controlled parameters.")
 
 
 def resolve_args(args, presets, original_defaults, preset_controlled):
@@ -480,6 +870,12 @@ def main():
                              '"zero" sets Halo pixels where SiR_mask > 0 to 0; '
                              '"NaN" sets them to NaN. Requires SiR_mask file in the image set. '
                              'Cannot be combined with --halo-bg-mode SiR_mean.')
+    parser.add_argument('--SiR-filter', action='store_true', default=None,
+                        help='Restrict Halo measurements to within SiR_mask: condensed Halo = '
+                             'P-body_mask & SiR_mask, dilute Halo = dilute_mask & SiR_mask. '
+                             'mNG measurements are unaffected. Requires a SiR_mask file in every '
+                             'image set. Cannot be combined with --SiR-subtract or '
+                             '--halo-bg-mode SiR_mean.')
     parser.add_argument('--FLIM-filter', choices=['zero', 'NaN'], default=None,
                         help='Apply FLIM mask filtering to Halo channel before analysis. '
                              '"zero" sets Halo pixels inside interaction_mask to 0; '
@@ -498,6 +894,22 @@ def main():
     parser.add_argument('--save-processed', action='store_true', default=None,
                         help='Save processed mNG and Halo .tif files (after bg subtraction and masking) '
                              'for troubleshooting')
+    parser.add_argument('--intermediate-assemblies', action='store_true', default=None,
+                        help='Three-region measurement (P-body, intermediate, dilute) using '
+                             'Dcp2_mask_2 and interaction_mask_2 to define the intermediate region. '
+                             'The dilute region is redefined as dilute_mask & Dcp2_mask & ~Dcp2_mask_2 '
+                             '(mNG) and dilute_mask & interaction_mask & ~interaction_mask_2 (Halo). '
+                             'Requires Dcp2_mask_2 and interaction_mask_2 files in every image set. '
+                             'Compatible with --single-cell (each cell gets per-region rows). '
+                             'Not compatible with any SiR option.')
+    parser.add_argument('--intermediate-zero-fill', action='store_true', default=None,
+                        help='Modifies --intermediate-assemblies to use v3-style halo handling: '
+                             'Halo means in the intermediate and dilute regions are dragged down by '
+                             'zeros from pixels outside the inner interaction mask, instead of those '
+                             'pixels being excluded from the mean. mNG dilute region is also broadened '
+                             'to dilute_mask & ~Dcp2_mask_2 (without intersecting Dcp2_mask). Percent '
+                             'columns are unchanged — only Halo means differ from --intermediate-assemblies. '
+                             'Requires --intermediate-assemblies to be on.')
 
     # --- Other ---
     parser.add_argument('--single-cell', action='store_true', default=False,
@@ -516,15 +928,50 @@ def main():
         return
 
     sir_subtract_mode = getattr(args, 'SiR_subtract', None)
+    sir_filter = bool(getattr(args, 'SiR_filter', False))
     flim_filter_mode = getattr(args, 'FLIM_filter', None)
     mng_filter_mode = getattr(args, 'mNG_filter', None)
     mng_in_flim = getattr(args, 'mNG_in_FLIM', 'no') == 'yes'
+    intermediate_assemblies = bool(getattr(args, 'intermediate_assemblies', False))
+    intermediate_zero_fill = bool(getattr(args, 'intermediate_zero_fill', False))
 
     # --- Check for incompatible --SiR-subtract and --halo-bg-mode SiR_mean ---
     if args.halo_bg_mode == 'SiR_mean' and sir_subtract_mode is not None:
         print("WARNING: --halo-bg-mode SiR_mean cannot be combined with --SiR-subtract.")
         print("Please remove --SiR-subtract when using --halo-bg-mode SiR_mean.")
         return
+
+    # --- Check for incompatible --SiR-filter combinations ---
+    if sir_filter and sir_subtract_mode is not None:
+        print("WARNING: --SiR-filter cannot be combined with --SiR-subtract.")
+        print("--SiR-filter intersects Halo with SiR_mask; --SiR-subtract removes it.")
+        return
+    if sir_filter and args.halo_bg_mode == 'SiR_mean':
+        print("WARNING: --SiR-filter cannot be combined with --halo-bg-mode SiR_mean.")
+        return
+
+    # --- Check for incompatible --intermediate-assemblies combinations ---
+    if intermediate_zero_fill and not intermediate_assemblies:
+        print("WARNING: --intermediate-zero-fill requires --intermediate-assemblies.")
+        return
+    if intermediate_assemblies:
+        if sir_subtract_mode is not None:
+            print("WARNING: --intermediate-assemblies cannot be combined with --SiR-subtract.")
+            return
+        if sir_filter:
+            print("WARNING: --intermediate-assemblies cannot be combined with --SiR-filter.")
+            return
+        if args.halo_bg_mode == 'SiR_mean':
+            print("WARNING: --intermediate-assemblies cannot be combined with --halo-bg-mode SiR_mean.")
+            return
+        if mng_filter_mode is None:
+            print("WARNING: --intermediate-assemblies requires --mNG-filter to be set "
+                  "(Dcp2_mask must be provided as the global mNG filter mask).")
+            return
+        if flim_filter_mode is None:
+            print("WARNING: --intermediate-assemblies requires --FLIM-filter to be set "
+                  "(interaction_mask must be provided as the global Halo filter mask).")
+            return
 
     def _check_channels(group_key, channels):
         """Validate that a group has all required channels. Returns True if valid."""
@@ -534,6 +981,9 @@ def main():
             return False
         if sir_subtract_mode is not None and 'SiR_mask' not in channels:
             print(f"Skipping {group_key}: --SiR-subtract requires SiR_mask file but none found")
+            return False
+        if sir_filter and 'SiR_mask' not in channels:
+            print(f"Skipping {group_key}: --SiR-filter requires a SiR_mask file but none found")
             return False
         if flim_filter_mode is not None and 'interaction_mask' not in channels:
             print(f"Skipping {group_key}: --FLIM-filter requires interaction_mask file but none found")
@@ -547,6 +997,14 @@ def main():
         if args.single_cell and 'cp_mask' not in channels:
             print(f"Skipping {group_key}: --single-cell requires cp_mask file but none found")
             return False
+        if intermediate_assemblies:
+            missing = [m for m in ('Dcp2_mask', 'interaction_mask',
+                                   'Dcp2_mask_2', 'interaction_mask_2')
+                       if m not in channels]
+            if missing:
+                print(f"Skipping {group_key}: --intermediate-assemblies requires "
+                      f"{', '.join(missing)} but none found")
+                return False
         return True
 
     def _analyze_group(group_key, channels, halo_bg_override=None):
@@ -571,6 +1029,11 @@ def main():
             halo_bg_override=halo_bg_override,
             single_cell=args.single_cell,
             cp_mask_path=channels.get('cp_mask'),
+            sir_filter=sir_filter,
+            intermediate_assemblies=intermediate_assemblies,
+            dcp2_mask_2_path=channels.get('Dcp2_mask_2'),
+            interaction_mask_2_path=channels.get('interaction_mask_2'),
+            intermediate_zero_fill=intermediate_zero_fill,
         )
         for r in results:
             r['group'] = group_key
@@ -644,8 +1107,25 @@ def main():
         return
 
     df = pd.DataFrame(all_results)
-    if args.single_cell:
-        col_order = ['group', 'cell_id', 'cell_area_px',
+    if args.single_cell and intermediate_assemblies:
+        col_order = ['group', 'cell_id', 'cell_area_px', 'particle_count',
+                     'pbody_area_px', 'intermediate_area_px', 'dilute_area_px',
+                     'mng_bg_value', 'halo_bg_value',
+                     'mNG_pbody_mean', 'mNG_intermediate_mean', 'mNG_dilute_mean',
+                     'mNG_pbody_integ', 'mNG_intermediate_integ', 'mNG_dilute_integ',
+                     'halo_pbody_mean', 'halo_intermediate_mean', 'halo_dilute_mean',
+                     'halo_pbody_integ', 'halo_intermediate_integ', 'halo_dilute_integ',
+                     'mNG_pbody_over_dilute', 'mNG_intermediate_over_dilute',
+                     'halo_pbody_over_dilute', 'halo_intermediate_over_dilute',
+                     'halo_over_mNG_pbody', 'halo_over_mNG_intermediate',
+                     'halo_over_mNG_dilute',
+                     'mNG_cell_mean']
+        if args.percent:
+            col_order += ['pct_halo_in_mNG_pbody',
+                          'pct_halo_in_mNG_intermediate',
+                          'pct_halo_in_mNG_dilute']
+    elif args.single_cell:
+        col_order = ['group', 'cell_id', 'cell_area_px', 'particle_count',
                      'pbody_area_px', 'dilute_area_px',
                      'mng_bg_value', 'halo_bg_value',
                      'mNG_pbody_mean', 'mNG_dilute_mean',
@@ -653,7 +1133,26 @@ def main():
                      'halo_pbody_mean', 'halo_dilute_mean',
                      'halo_pbody_integ', 'halo_dilute_integ',
                      'mNG_pbody_over_dilute', 'halo_pbody_over_dilute',
-                     'halo_over_mNG_pbody', 'halo_over_mNG_dilute']
+                     'halo_over_mNG_pbody', 'halo_over_mNG_dilute',
+                     'mNG_cell_mean']
+        if args.percent:
+            col_order += ['pct_halo_in_mNG_pbody', 'pct_halo_in_mNG_dilute']
+    elif intermediate_assemblies:
+        col_order = ['group',
+                     'pbody_area_px', 'intermediate_area_px', 'dilute_area_px',
+                     'mng_bg_value', 'halo_bg_value',
+                     'mNG_pbody_mean', 'mNG_intermediate_mean', 'mNG_dilute_mean',
+                     'mNG_pbody_integ', 'mNG_intermediate_integ', 'mNG_dilute_integ',
+                     'halo_pbody_mean', 'halo_intermediate_mean', 'halo_dilute_mean',
+                     'halo_pbody_integ', 'halo_intermediate_integ', 'halo_dilute_integ',
+                     'mNG_pbody_over_dilute', 'mNG_intermediate_over_dilute',
+                     'halo_pbody_over_dilute', 'halo_intermediate_over_dilute',
+                     'halo_over_mNG_pbody', 'halo_over_mNG_intermediate',
+                     'halo_over_mNG_dilute']
+        if args.percent:
+            col_order += ['pct_halo_in_mNG_pbody',
+                          'pct_halo_in_mNG_intermediate',
+                          'pct_halo_in_mNG_dilute']
     else:
         col_order = ['group', 'pbody_area_px', 'dilute_area_px',
                      'mng_bg_value', 'halo_bg_value',
@@ -663,16 +1162,28 @@ def main():
                      'halo_pbody_integ', 'halo_dilute_integ',
                      'mNG_pbody_over_dilute', 'halo_pbody_over_dilute',
                      'halo_over_mNG_pbody', 'halo_over_mNG_dilute']
-    if args.percent:
-        col_order += ['pct_halo_in_mNG_pbody', 'pct_halo_in_mNG_dilute']
+        if args.percent:
+            col_order += ['pct_halo_in_mNG_pbody', 'pct_halo_in_mNG_dilute']
     df = df[col_order]
     df.to_csv(args.output, index=False)
     print(f"\nResults saved to {args.output}")
-    if args.single_cell:
+    if args.single_cell and intermediate_assemblies:
+        print(f"Total cells analyzed: {len(df)}")
+        print(f"\nSummary by group:")
+        print(df.groupby('group')[['mNG_pbody_mean', 'mNG_intermediate_mean', 'mNG_dilute_mean',
+                                    'halo_pbody_mean', 'halo_intermediate_mean',
+                                    'halo_dilute_mean']].mean().to_string())
+    elif args.single_cell:
         print(f"Total cells analyzed: {len(df)}")
         print(f"\nSummary by group:")
         print(df.groupby('group')[['mNG_pbody_mean', 'mNG_dilute_mean',
                                     'halo_pbody_mean', 'halo_dilute_mean']].mean().to_string())
+    elif intermediate_assemblies:
+        print(f"Total fields analyzed: {len(df)}")
+        print(f"\nSummary:")
+        print(df[['group',
+                  'mNG_pbody_mean', 'mNG_intermediate_mean', 'mNG_dilute_mean',
+                  'halo_pbody_mean', 'halo_intermediate_mean', 'halo_dilute_mean']].to_string(index=False))
     else:
         print(f"Total fields analyzed: {len(df)}")
         print(f"\nSummary:")
